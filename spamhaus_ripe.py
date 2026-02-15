@@ -128,6 +128,11 @@ def main():
             {
                 "comment": "Converted the Spamhaus DROP lists into a consolidated list of IP ranges using the RIPEstat API.",
                 "timestamp": get_current_timestamp(),
+                "ASN-DROP": f"{len(asn_drop)} entries, converted to {len(ip_ranges)} unique IP ranges",
+                "DROP v4": f"{len(drop4)} entries",
+                "DROP v6": f"{len(drop6)} entries",
+                "consolidated v4": f"{len(consolidated_ipv4)} IPv4 ranges",
+                "consolidated v6": f"{len(consolidated_ipv6)} IPv6 ranges",
                 "v4": consolidated_ipv4,
                 "v6": consolidated_ipv6,
             }
