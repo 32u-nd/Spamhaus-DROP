@@ -1,5 +1,7 @@
 # Spamhaus DROP — Consolidated IP Blocklist
 
+![Update Spamhaus DROP JSON](https://github.com/32u-nd/Spamhaus-DROP/actions/workflows/update-blocklist.yml/badge.svg)
+
 A Python script and GitHub Actions workflow that fetches ASN and IP block data from the **Spamhaus DROP lists** and the **RIPEstat API**, consolidates all overlapping IPv4 and IPv6 ranges, and commits the result as a flat JSON file directly to this repository.
 
 The JSON is updated automatically **twice a day** (06:05 UTC and 18:05 UTC) via GitHub Actions.
