@@ -1,149 +1,281 @@
-# This file is part of the repository 32u-nd/Spamhaus-DROP.
-#
-# 32u-nd/Spamhaus-DROP is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# 32u-nd/Spamhaus-DROP is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU Affero General Public License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with 32u-nd/Spamhaus-DROP. If not, see <https://www.gnu.org/licenses/>.
-#
-# Copyright (C) 2026 32u-nd
-
 """
-This script fetches ASN and IP block data from Spamhaus and RIPEstat API, consolidates overlapping IPv4 and IPv6 ranges, and outputs the result as a JSON file.
-It handles invalid IPs gracefully, logging errors without halting execution.
-The script is useful for identifying and managing potentially malicious IP ranges.
-"""
+spamhaus_ripe.py
 
-import json
-import requests
-import ipaddress
-from datetime import datetime
+Fetches ASN and IP block data from the Spamhaus DROP lists and the RIPEstat API,
+consolidates all overlapping/adjacent IPv4 and IPv6 ranges across all ASNs, and
+writes a single flat JSON object to spamhaus_ripe.json.
 
-# Constants for URLs
-SPAMHAUS_URLS = {
-    "asn": "https://www.spamhaus.org/drop/asndrop.json",
-    "drop_v4": "https://www.spamhaus.org/drop/drop_v4.json",
-    "drop_v6": "https://www.spamhaus.org/drop/drop_v6.json",
+ASNs are used only as an intermediate step to resolve IP prefixes via RIPEstat.
+They do not appear in the output.
+
+Data sources:
+  - Spamhaus ASN-DROP:  https://www.spamhaus.org/drop/asndrop.json  (NDJSON)
+  - Spamhaus DROP (v4): https://www.spamhaus.org/drop/drop_v4.json  (NDJSON)
+  - Spamhaus DROP (v6): https://www.spamhaus.org/drop/drop_v6.json  (NDJSON)
+  - RIPEstat API:       https://stat.ripe.net/data/announced-prefixes/data.json
+
+Note: All Spamhaus endpoints return NDJSON (one JSON object per line), not a
+JSON array. The last line is always a metadata record and is ignored.
+
+Output format (spamhaus_ripe.json):
+{
+  "v4": ["1.2.3.0/24", ...],
+  "v6": ["2001:db8::/32", ...]
 }
+"""
 
-RIPESTAT_URL = (
-    "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS{asn}"
+import ipaddress
+import json
+import logging
+import sys
+from datetime import datetime, timezone
+
+import requests
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+SPAMHAUS_ASN_DROP_URL = "https://www.spamhaus.org/drop/asndrop.json"
+SPAMHAUS_DROP_V4_URL = "https://www.spamhaus.org/drop/drop_v4.json"
+SPAMHAUS_DROP_V6_URL = "https://www.spamhaus.org/drop/drop_v6.json"
+RIPESTAT_URL = "https://stat.ripe.net/data/announced-prefixes/data.json"
+
+OUTPUT_FILE = "spamhaus_ripe.json"
+REQUEST_TIMEOUT = 30  # seconds per HTTP request
+RIPE_MAX_RETRIES = 2  # retries for RIPEstat lookups
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%SZ",
 )
+log = logging.getLogger(__name__)
 
 
-def fetch_spamhaus_list(url, session):
-    """Fetch a list from Spamhaus."""
-    try:
-        response = session.get(url)
-        response.raise_for_status()
-        return [
-            entry.get("asn", entry.get("cidr"))
-            for entry in map(json.loads, response.text.splitlines())
-        ]
-    except requests.RequestException as e:
-        print(f"Failed to retrieve list from {url}: {e}")
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+
+
+def fetch_text(url: str, retries: int = 0) -> str | None:
+    """Fetch *url* and return the raw response text. Returns None on error."""
+    for attempt in range(retries + 1):
+        try:
+            response = requests.get(url, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            return response.text
+        except requests.exceptions.RequestException as exc:
+            log.warning(
+                "Request failed (attempt %d/%d): %s — %s",
+                attempt + 1,
+                retries + 1,
+                url,
+                exc,
+            )
+    return None
+
+
+def fetch_json(
+    url: str, params: dict | None = None, retries: int = 0
+) -> dict | list | None:
+    """Fetch *url* with optional query *params* and return parsed JSON. Returns None on error."""
+    for attempt in range(retries + 1):
+        try:
+            response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as exc:
+            log.warning(
+                "Request failed (attempt %d/%d): %s — %s",
+                attempt + 1,
+                retries + 1,
+                url,
+                exc,
+            )
+        except json.JSONDecodeError as exc:
+            log.warning("JSON decode error for %s: %s", url, exc)
+            return None
+    return None
+
+
+def parse_ndjson(text: str) -> list[dict]:
+    """
+    Parse a Newline-Delimited JSON (NDJSON) response into a list of dicts.
+    Lines that cannot be parsed or that represent metadata records are skipped.
+    """
+    records: list[dict] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            log.warning("Skipping unparseable NDJSON line: %.80s", line)
+            continue
+        # Skip the trailing metadata record present in all Spamhaus DROP files
+        if obj.get("type") == "metadata":
+            continue
+        records.append(obj)
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Spamhaus helpers
+# ---------------------------------------------------------------------------
+
+
+def fetch_spamhaus_asns() -> list[int]:
+    """Return a sorted list of unique ASNs from the Spamhaus ASN-DROP list."""
+    text = fetch_text(SPAMHAUS_ASN_DROP_URL)
+    if not text:
+        log.error("Failed to fetch Spamhaus ASN-DROP list.")
         return []
 
+    asns: set[int] = set()
+    for record in parse_ndjson(text):
+        asn = record.get("asn")
+        if asn is not None:
+            try:
+                asns.add(int(asn))
+            except (ValueError, TypeError):
+                log.warning("Unreadable ASN value, skipping: %s", asn)
 
-def fetch_asn_ip_ranges(asn_list, session):
-    """Convert ASN to IP ranges using the RIPEstat API."""
-    ip_ranges = set()
-    for asn in asn_list:
+    log.info("Fetched %d unique ASNs from Spamhaus ASN-DROP.", len(asns))
+    return sorted(asns)
+
+
+def fetch_spamhaus_prefixes() -> tuple[list[str], list[str]]:
+    """
+    Return (v4_prefixes, v6_prefixes) from the Spamhaus DROP v4/v6 lists.
+    Invalid entries are skipped with a warning.
+    """
+    v4: list[str] = []
+    v6: list[str] = []
+
+    for url, container, label in [
+        (SPAMHAUS_DROP_V4_URL, v4, "DROP-v4"),
+        (SPAMHAUS_DROP_V6_URL, v6, "DROP-v6"),
+    ]:
+        text = fetch_text(url)
+        if not text:
+            log.error("Failed to fetch Spamhaus %s list.", label)
+            continue
+        for record in parse_ndjson(text):
+            cidr = record.get("cidr")
+            if not cidr:
+                continue
+            try:
+                ipaddress.ip_network(cidr, strict=False)
+                container.append(cidr)
+            except ValueError:
+                log.warning("Invalid CIDR in %s, skipping: %s", label, cidr)
+
+        log.info("Fetched %d prefixes from Spamhaus %s.", len(container), label)
+
+    return v4, v6
+
+
+# ---------------------------------------------------------------------------
+# RIPEstat helper
+# ---------------------------------------------------------------------------
+
+
+def fetch_ripe_prefixes(asn: int) -> tuple[list[str], list[str]]:
+    """
+    Query RIPEstat for all prefixes announced by *asn*.
+    Returns (v4_prefixes, v6_prefixes).
+    """
+    data = fetch_json(
+        RIPESTAT_URL, params={"resource": f"AS{asn}"}, retries=RIPE_MAX_RETRIES
+    )
+    if not data:
+        log.warning("No RIPEstat data for AS%d.", asn)
+        return [], []
+
+    v4: list[str] = []
+    v6: list[str] = []
+
+    for entry in data.get("data", {}).get("prefixes", []):  # type: ignore
+        cidr = entry.get("prefix")
+        if not cidr:
+            continue
         try:
-            response = session.get(RIPESTAT_URL.format(asn=asn))
-            response.raise_for_status()
-            data = response.json()
-            prefixes = data.get("data", {}).get("prefixes", [])
-            ip_ranges.update(prefix["prefix"] for prefix in prefixes)
-        except requests.RequestException as e:
-            print(f"Failed to retrieve IP ranges for ASN {asn}: {e}")
-    return list(ip_ranges)
+            network = ipaddress.ip_network(cidr, strict=False)
+            (v4 if network.version == 4 else v6).append(cidr)
+        except ValueError:
+            log.warning(
+                "Invalid prefix from RIPEstat for AS%d, skipping: %s", asn, cidr
+            )
+
+    return v4, v6
 
 
-def consolidate_ip_ranges(ip_ranges):
-    """Consolidate overlapping or adjacent IP ranges into broader CIDR blocks."""
-    ipv4_ranges = []
-    ipv6_ranges = []
+# ---------------------------------------------------------------------------
+# IP consolidation
+# ---------------------------------------------------------------------------
 
-    for ip in ip_ranges:
+
+def consolidate(cidrs: list[str]) -> list[str]:
+    """
+    Collapse a list of CIDR strings into the minimal set of non-overlapping
+    supernets using Python's ipaddress.collapse_addresses().
+    """
+    networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for cidr in cidrs:
         try:
-            # Try to create an ip_network object
-            network = ipaddress.ip_network(ip)
-            if network.version == 4:
-                ipv4_ranges.append(network)
-            elif network.version == 6:
-                ipv6_ranges.append(network)
-        except ValueError as e:
-            # Catch ValueError and print a message for invalid IP addresses
-            print(f"Skipping invalid IP address or CIDR: {ip}. Error: {e}")
+            networks.append(ipaddress.ip_network(cidr, strict=False))
+        except ValueError:
+            log.warning("Skipping invalid CIDR during consolidation: %s", cidr)
 
-    return [
-        [str(net) for net in ipaddress.collapse_addresses(ipv4_ranges)],
-        [str(net) for net in ipaddress.collapse_addresses(ipv6_ranges)],
-    ]
+    return [str(n) for n in ipaddress.collapse_addresses(networks)]  # type: ignore
 
 
-def get_current_timestamp():
-    """Return the current timestamp."""
-    return datetime.now().astimezone().isoformat(timespec="seconds")
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 
-def main():
-    """main loop"""
+def main() -> None:
+    log.info(
+        "Starting Spamhaus DROP fetch — %s UTC",
+        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+    )
 
-    start_time = datetime.now()
-    print(f"Start Time: {get_current_timestamp()}")
+    # Step 1: Collect all ASNs from Spamhaus ASN-DROP
+    asns = fetch_spamhaus_asns()
+    if not asns:
+        log.error("No ASNs retrieved — aborting.")
+        sys.exit(1)
 
-    with requests.Session() as session:
-        # Fetch lists from Spamhaus
-        drop4 = fetch_spamhaus_list(SPAMHAUS_URLS["drop_v4"], session)
-        drop6 = fetch_spamhaus_list(SPAMHAUS_URLS["drop_v6"], session)
-        asn_drop = fetch_spamhaus_list(SPAMHAUS_URLS["asn"], session)
+    # Step 2: Collect standalone Spamhaus DROP prefixes (v4 + v6)
+    all_v4, all_v6 = fetch_spamhaus_prefixes()
 
-        print(f"Spamhaus DROP v4: {len(drop4)} entries")
-        print(f"Spamhaus DROP v6: {len(drop6)} entries")
-        print(f"Spamhaus ASN-DROP: {len(asn_drop)} entries")
+    # Step 3: Resolve each ASN to its announced prefixes via RIPEstat and accumulate
+    for asn in asns:
+        log.info("Processing AS%d …", asn)
+        ripe_v4, ripe_v6 = fetch_ripe_prefixes(asn)
+        all_v4.extend(ripe_v4)
+        all_v6.extend(ripe_v6)
 
-        # Fetch corresponding IP ranges from ASN
-        ip_ranges = fetch_asn_ip_ranges(asn_drop, session)
-        print(f"Fetched {len(ip_ranges)} unique IP ranges")
+    # Step 4: Consolidate everything into a minimal flat list per IP version
+    log.info(
+        "Consolidating %d raw IPv4 and %d raw IPv6 prefixes …", len(all_v4), len(all_v6)
+    )
+    result = {
+        "v4": consolidate(all_v4),
+        "v6": consolidate(all_v6),
+    }
 
-        # Consolidate the IP ranges
-        consolidated_ipv4, consolidated_ipv6 = consolidate_ip_ranges(
-            ip_ranges + drop4 + drop6
-        )
-        print(
-            f"Consolidated to {len(consolidated_ipv4)} IPv4 ranges and {len(consolidated_ipv6)} IPv6 ranges"
-        )
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as fh:
+        json.dump(result, fh, indent=2, ensure_ascii=False)
 
-        # Save the result to a JSON file
-        output_data = [
-            {
-                "comment": "Converted the Spamhaus DROP lists into a consolidated list of IP ranges using the RIPEstat API.",
-                "timestamp": get_current_timestamp(),
-                "ASN-DROP": f"{len(asn_drop)} entries, converted to {len(ip_ranges)} unique IP ranges",
-                "DROP v4": f"{len(drop4)} entries",
-                "DROP v6": f"{len(drop6)} entries",
-                "consolidated v4": f"{len(consolidated_ipv4)} IPv4 ranges",
-                "consolidated v6": f"{len(consolidated_ipv6)} IPv6 ranges",
-                "v4": consolidated_ipv4,
-                "v6": consolidated_ipv6,
-            }
-        ]
-        with open("spamhaus_ripe.json", "w") as file:
-            json.dump(output_data, file, indent=2)
-
-    end_time = datetime.now()
-    print(f"End Time: {get_current_timestamp()}")
-    print(
-        f"Execution time: {round((end_time - start_time).total_seconds(), 1)} seconds"
+    log.info(
+        "Done. Wrote %d IPv4 and %d IPv6 prefixes to %s.",
+        len(result["v4"]),
+        len(result["v6"]),
+        OUTPUT_FILE,
     )
 
 
