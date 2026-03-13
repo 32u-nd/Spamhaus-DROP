@@ -4,7 +4,7 @@
 
 A Python script and GitHub Actions workflow that fetches ASN and IP block data from the **Spamhaus DROP lists** and the **RIPEstat API**, consolidates all overlapping IPv4 and IPv6 ranges, and commits the result as a flat JSON file directly to this repository.
 
-The JSON is updated automatically **twice a day** (06:05 UTC and 18:05 UTC) via GitHub Actions.
+The JSON is triggered automatically **twice a day** (06:05 UTC and 18:05 UTC) via GitHub Actions; depending on the platform load, it may be executed later.
 
 ---
 
