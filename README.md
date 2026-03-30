@@ -19,7 +19,7 @@ No Gist, no third-party hosting — the URL never changes.
 
 ---
 
-## Output format
+## Output Format
 
 ```json
 {
@@ -55,7 +55,7 @@ Invalid CIDR strings are skipped with a warning and never halt execution.
 
 ---
 
-## GitHub Actions workflow
+## GitHub Actions Workflow
 
 The workflow file is located at `.github/workflows/update-blocklist.yml`.
 
